@@ -1,10 +1,11 @@
 """Walk-forward validation for cross-sectional (weight-based) strategies.
 
 Each fold:
-  - Grid-search parameters on the TRAIN window (via run_portfolio_weights).
+  - Grid-search parameters on the TRAIN window.
+  - Skip params whose lookback exceeds the test window (avoid silent no-trades).
   - Pick the params that maximize `select_metric` on train.
-  - Apply the chosen params to the TEST window (out-of-sample).
-  - Append the test-period portfolio returns to the stitched OOS series.
+  - Apply them to the TEST window (out-of-sample).
+  - Append test-period portfolio returns to the stitched OOS series.
 """
 from __future__ import annotations
 
@@ -23,8 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 class XSStrategy(Protocol):
-    """Protocol: any object with `generate_weights(prices_by_symbol) -> DataFrame`."""
-
     def generate_weights(self, prices_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame: ...
 
 
@@ -61,6 +60,22 @@ def _slice_prices(
     return out
 
 
+def _lookback_fits(lookback: Any, test_bars: int, train_bars: int) -> bool:
+    """A parameter set is valid only if the lookback fits in BOTH windows.
+
+    We use the train window (3x longer) for warm-up during grid search, and
+    the test window for the OOS run. If the lookback exceeds the test window
+    length, the strategy will produce no signals during the test period —
+    silently returning zeros. Reject such params up front.
+    """
+    try:
+        lb = int(lookback)
+    except (TypeError, ValueError):
+        return True
+    # Require at least 5 tradable bars after warm-up in the test window.
+    return lb + 5 <= test_bars
+
+
 def walk_forward_xs(
     prices_by_symbol: dict[str, pd.DataFrame],
     strategy_factory: Callable[..., XSStrategy],
@@ -72,21 +87,6 @@ def walk_forward_xs(
     config: BacktestConfig | None = None,
     min_symbols: int = 5,
 ) -> WalkForwardXSResult:
-    """Walk-forward for a cross-sectional strategy.
-
-    Parameters
-    ----------
-    prices_by_symbol : dict[str, DataFrame]
-        One OHLCV frame per symbol. All must contain an `adj close` column.
-    strategy_factory : callable
-        Called as `strategy_factory(**params)` to build the strategy.
-    param_grid : dict[str, Iterable]
-        e.g. {"lookback": [20, 60, 120], "top_n": [3, 5, 10]}
-    select_metric : str
-        One of {"sharpe", "total_return", "calmar", "sortino"}.
-    min_symbols : int
-        Skip folds where fewer than this many symbols have data.
-    """
     if select_metric not in {"sharpe", "total_return", "calmar", "sortino"}:
         raise ValueError(f"unsupported select_metric: {select_metric!r}")
     if not prices_by_symbol:
@@ -97,7 +97,6 @@ def walk_forward_xs(
     if not combos:
         raise ValueError("param_grid produced no combinations")
 
-    # Common calendar index (union of all symbols' indexes).
     common_index: pd.DatetimeIndex | None = None
     for df in prices_by_symbol.values():
         common_index = df.index if common_index is None else common_index.union(df.index)
@@ -122,10 +121,26 @@ def walk_forward_xs(
             )
             continue
 
+        # Number of bars in each window (use the longest available).
+        train_bars = max((len(df) for df in train.values()), default=0)
+        test_bars = max((len(df) for df in test.values()), default=0)
+
+        # Filter params whose lookback can't fit the test window.
+        valid_combos = [
+            p for p in combos
+            if _lookback_fits(p.get("lookback"), test_bars, train_bars)
+        ]
+        if not valid_combos:
+            logger.warning(
+                "fold %d skipping: no params fit (test_bars=%d, combos=%d)",
+                i, test_bars, len(combos),
+            )
+            continue
+
         # --- Grid-search on train
         best_row: pd.Series | None = None
         best_params: dict[str, Any] | None = None
-        for params in combos:
+        for params in valid_combos:
             try:
                 strat = strategy_factory(**params)
                 weights = strat.generate_weights(train)
@@ -159,6 +174,8 @@ def walk_forward_xs(
                 "test_end": (te_e - pd.Timedelta(days=1)).date(),
                 "n_train_symbols": len(train),
                 "n_test_symbols": len(test),
+                "train_bars": train_bars,
+                "test_bars": test_bars,
                 **{f"best_{k}": v for k, v in best_params.items()},
                 "train_sharpe": float(best_row["sharpe"]),
                 "train_total_return": float(best_row["total_return"]),
