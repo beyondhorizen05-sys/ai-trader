@@ -3,9 +3,6 @@
 Rolling train/test windows: pick the best parameters on each train slice,
 apply them to the next unseen test slice, stitch the out-of-sample equity
 together. This is the honest test of whether a parameter search generalizes.
-
-No look-ahead: at every point in time, only past data is used to choose
-parameters.
 """
 from __future__ import annotations
 
@@ -24,28 +21,23 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WalkForwardResult:
-    oos_equity: pd.Series              # stitched out-of-sample equity curve
-    oos_returns: pd.Series             # per-bar OOS returns
-    folds: pd.DataFrame                # one row per fold: train/test dates, chosen params, train & test metrics
+    oos_equity: pd.Series
+    oos_returns: pd.Series
+    folds: pd.DataFrame
     best_params_per_fold: list[dict[str, Any]] = field(default_factory=list)
     config: BacktestConfig | None = field(default=None, repr=False)
 
     def summary(self) -> str:
-        m = self.folds
-        if m.empty:
+        if self.folds.empty:
             return "no folds"
         lines = [
-            f"folds            {len(m)}",
+            f"folds            {len(self.folds)}",
             f"OOS total return {self.oos_equity.iloc[-1] / self.oos_equity.iloc[0] - 1:.2%}",
             f"OOS Sharpe       {_sharpe(self.oos_returns):.2f}",
             f"OOS max DD       {_max_dd(self.oos_equity):.2%}",
         ]
         return "\n".join(lines)
 
-
-# ---------------------------------------------------------------------------
-# Helpers (kept local to avoid circular imports)
-# ---------------------------------------------------------------------------
 
 def _sharpe(returns: pd.Series, periods: int = 252) -> float:
     r = returns.dropna()
@@ -61,20 +53,12 @@ def _max_dd(equity: pd.Series) -> float:
     return float(-dd.min())
 
 
-# ---------------------------------------------------------------------------
-# Core
-# ---------------------------------------------------------------------------
-
 def _date_slices(
     index: pd.DatetimeIndex,
     train_years: int,
     test_years: int,
     step_years: int,
 ) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
-    """Return a list of (train_start, train_end, test_start, test_end) tuples.
-
-    Uses calendar years. Windows roll forward by `step_years`.
-    """
     start = index.min()
     end = index.max()
     folds: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
@@ -103,22 +87,6 @@ def walk_forward(
     config: BacktestConfig | None = None,
     feature_builder: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
 ) -> WalkForwardResult:
-    """Run walk-forward validation.
-
-    Parameters
-    ----------
-    prices : DataFrame
-        OHLCV frame with `adj close`, single symbol.
-    strategy_cls : type[Strategy]
-    param_grid : dict[str, Iterable]
-    train_years, test_years, step_years : int
-        Rolling window sizes in calendar years.
-    select_metric : str
-        Metric to maximize on each train slice when choosing parameters.
-    config : BacktestConfig, optional
-    feature_builder : callable, optional
-        Applied to each full train+test slice (safe — indicators are causal).
-    """
     if train_years <= 0 or test_years <= 0 or step_years <= 0:
         raise ValueError("train_years, test_years, step_years must be positive")
     if select_metric not in {"sharpe", "total_return", "calmar", "sortino"}:
@@ -148,7 +116,6 @@ def walk_forward(
         train_feat = feature_builder(train) if feature_builder else train
         test_feat = feature_builder(test) if feature_builder else test
 
-        # --- 1. Grid-search on train
         best_row: pd.Series | None = None
         best_params: dict[str, Any] | None = None
         for params in combos:
@@ -168,7 +135,6 @@ def walk_forward(
             logger.warning("fold %d: no valid params, skipping", i)
             continue
 
-        # --- 2. Apply chosen params on test
         strat = strategy_cls(**best_params)
         sig = strat.generate_signals(test_feat)
         test_result = run_backtest(test, sig, cfg)

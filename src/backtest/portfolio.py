@@ -1,0 +1,111 @@
+"""Multi-symbol portfolio backtest.
+
+Runs the same strategy on N symbols, allocates equal weight across active
+positions each bar, and aggregates into a single equity curve.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+import pandas as pd
+
+from src.backtest import metrics as M
+from src.backtest.engine import BacktestConfig, prepare_prices
+from src.strategies.base import Strategy
+
+
+@dataclass
+class PortfolioResult:
+    equity: pd.Series
+    returns: pd.Series
+    weights: pd.DataFrame
+    per_symbol: dict[str, pd.Series] = field(default_factory=dict)
+    metrics: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    config: BacktestConfig | None = field(default=None, repr=False)
+
+    def summary(self) -> str:
+        m = self.metrics
+        lines = [
+            f"symbols          {len(self.per_symbol)}",
+            f"total return     {m['total_return']:.2%}",
+            f"CAGR             {m['cagr']:.2%}",
+            f"volatility       {m['volatility']:.2%}",
+            f"Sharpe           {m['sharpe']:.2f}",
+            f"max drawdown     {m['max_drawdown']:.2%}",
+            f"calmar           {m['calmar']:.2f}",
+        ]
+        return "\n".join(lines)
+
+
+def run_portfolio(
+    prices_by_symbol: dict[str, pd.DataFrame],
+    strategy_factory: Callable[[str], Strategy],
+    config: BacktestConfig | None = None,
+    feature_builder: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
+) -> PortfolioResult:
+    cfg = config or BacktestConfig()
+    if not prices_by_symbol:
+        raise ValueError("prices_by_symbol is empty")
+
+    common_index: pd.DatetimeIndex | None = None
+    for df in prices_by_symbol.values():
+        common_index = df.index if common_index is None else common_index.union(df.index)
+    assert common_index is not None
+    common_index = common_index.sort_values()
+
+    per_symbol_returns: dict[str, pd.Series] = {}
+    per_symbol_signals: dict[str, pd.Series] = {}
+
+    for sym, df in prices_by_symbol.items():
+        aligned = df.reindex(common_index).ffill()
+        feats = feature_builder(aligned) if feature_builder else aligned
+        strat = strategy_factory(sym)
+        sig = strat.generate_signals(feats)
+
+        adj = prepare_prices(aligned) if "adj close" in aligned.columns else aligned.copy()
+        close_ret = adj["close"].pct_change().fillna(0.0)
+
+        target = sig.reindex(common_index).fillna(0).astype(int)
+        executed = target.shift(1).fillna(0).astype(int) * cfg.position_size
+
+        gross = executed * close_ret
+        turnover = executed.diff().abs().fillna(executed.abs())
+        cost = turnover * ((cfg.commission_bps + cfg.slippage_bps) / 10_000.0)
+        net = gross - cost
+
+        per_symbol_returns[sym] = net.rename(sym)
+        per_symbol_signals[sym] = executed.rename(sym)
+
+    returns_df = pd.DataFrame(per_symbol_returns)
+    signals_df = pd.DataFrame(per_symbol_signals)
+
+    active = (signals_df != 0)
+    n_active = active.sum(axis=1).replace(0, np.nan)
+    weights = active.div(n_active, axis=0).fillna(0.0)
+
+    portfolio_ret = (weights * returns_df).sum(axis=1).rename("net_return")
+
+    equity = cfg.initial_capital * (1.0 + portfolio_ret).cumprod()
+    metrics = pd.Series(
+        {
+            "total_return": M.total_return(equity),
+            "cagr": M.cagr(equity),
+            "volatility": M.volatility(portfolio_ret),
+            "sharpe": M.sharpe(portfolio_ret, rf=cfg.rf),
+            "sortino": M.sortino(portfolio_ret, rf=cfg.rf),
+            "max_drawdown": M.max_drawdown(equity),
+            "calmar": M.calmar(equity),
+            "exposure": float((weights.sum(axis=1) > 0).mean()),
+        }
+    )
+
+    return PortfolioResult(
+        equity=equity,
+        returns=portfolio_ret,
+        weights=weights,
+        per_symbol=per_symbol_returns,
+        metrics=metrics,
+        config=cfg,
+    )

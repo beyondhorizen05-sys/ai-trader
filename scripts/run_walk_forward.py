@@ -1,8 +1,8 @@
 """Walk-forward validation demo on processed AAPL data.
 
 Produces:
-  notebooks/wf_equity.png       OOS equity vs. buy & hold vs. in-sample best
-  notebooks/wf_folds.csv        per-fold: dates, chosen params, train/test metrics
+  notebooks/wf_equity.png
+  notebooks/wf_folds.csv
   notebooks/wf_oos_equity.parquet
 """
 from __future__ import annotations
@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import pandas as pd
 
 from src.backtest.engine import BacktestConfig, run_backtest
 from src.backtest.walk_forward import walk_forward
@@ -47,7 +46,6 @@ def main() -> None:
 
     print("\n=== Walk-forward summary ===")
     print(result.summary())
-
     print("\n=== Per-fold detail ===")
     print(result.folds.to_string(index=False))
 
@@ -56,16 +54,13 @@ def main() -> None:
     print(f"\nsaved {OUT_DIR / 'wf_folds.csv'}")
     print(f"saved {OUT_DIR / 'wf_oos_equity.parquet'}")
 
-    # Reference curves for the plot
     bh = prices["adj close"] / prices["adj close"].iloc[0] * cfg.initial_capital
-
     in_sample = run_backtest(
         prices,
         SmaCross(fast=20, slow=50, allow_short=False).generate_signals(add_all(prices)),
         cfg,
     )
 
-    # Plot on OOS date range
     start = result.oos_equity.index[0]
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.plot(result.oos_equity.index, result.oos_equity, label="Walk-forward OOS", linewidth=1.6)
@@ -77,9 +72,8 @@ def main() -> None:
     ax.legend()
     ax.grid(alpha=0.3)
     plt.tight_layout()
-    out_path = OUT_DIR / "wf_equity.png"
-    plt.savefig(out_path, dpi=120)
-    print(f"saved {out_path}")
+    plt.savefig(OUT_DIR / "wf_equity.png", dpi=120)
+    print(f"saved {OUT_DIR / 'wf_equity.png'}")
 
 
 if __name__ == "__main__":
