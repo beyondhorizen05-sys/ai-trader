@@ -1,13 +1,8 @@
-"""Walk-forward the long-only cross-sectional momentum strategy.
-
-Produces:
-  notebooks/wf_xsm_equity.png
-  notebooks/wf_xsm_folds.csv
-  notebooks/wf_xsm_oos_equity.parquet
-"""
+"""Walk-forward the redesigned long-only XS momentum (monthly, 12-1)."""
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -45,75 +40,71 @@ def _equal_weight_bh(prices: dict[str, pd.DataFrame], capital: float) -> pd.Seri
     return capital * (1 + ew).cumprod()
 
 
-def main(universe_name: str = "large_cap_30") -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+def main(universe_name: str = "large_cap_100") -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     print(SURVIVORSHIP_WARNING)
 
     symbols = get_universe(universe_name)
     prices = _load_prices(symbols)
-    if len(prices) < 10:
-        raise SystemExit(f"only {len(prices)} symbols available; fetch first")
     print(f"\nLoaded {len(prices)} symbols\n")
+    if len(prices) < 20:
+        raise SystemExit(f"only {len(prices)} symbols available")
 
     cfg = BacktestConfig(commission_bps=1.0, slippage_bps=2.0)
 
-    # Long-only XS momentum grid: vary lookback and top_n.
-    # We exclude bottom_n from the grid (always 0) so the strategy stays long-only,
-    # which is the only configuration that produced positive results.
     def factory(**params) -> XSMomentum:
-        return XSMomentum(bottom_n=0, min_history=10, **params)
+        return XSMomentum(bottom_n=0, min_history=30, rebalance_freq="ME",
+                          skip_recent=21, **params)
 
     result = walk_forward_xs(
         prices_by_symbol=prices,
         strategy_factory=factory,
         param_grid={
-            "lookback": [20, 60, 120],
-            "top_n": [3, 5, 10],
+            "lookback": [126, 189, 252],     # 6, 9, 12 months
+            "top_n":    [5, 10, 20],
         },
         train_years=3,
         test_years=1,
         step_years=1,
         select_metric="sharpe",
         config=cfg,
-        min_symbols=10,
+        min_symbols=20,
     )
 
-    print("\n=== Walk-forward XS momentum summary ===")
+    print("\n=== Walk-forward XS momentum v2 summary ===")
     print(result.summary())
     print("\n=== Per-fold detail ===")
     print(result.folds.to_string(index=False))
 
-    result.folds.to_csv(OUT_DIR / "wf_xsm_folds.csv", index=False)
-    result.oos_equity.to_frame("equity").to_parquet(OUT_DIR / "wf_xsm_oos_equity.parquet")
-    print(f"\nsaved {OUT_DIR / 'wf_xsm_folds.csv'}")
-    print(f"saved {OUT_DIR / 'wf_xsm_oos_equity.parquet'}")
+    result.folds.to_csv(OUT_DIR / "wf_xsm_v2_folds.csv", index=False)
+    result.oos_equity.to_frame("equity").to_parquet(OUT_DIR / "wf_xsm_v2_oos_equity.parquet")
 
-    # Reference curves
     ew_bh = _equal_weight_bh(prices, cfg.initial_capital)
 
-    # In-sample long-only XS momentum with fixed default params (for context)
-    fixed = XSMomentum(lookback=60, top_n=5, bottom_n=0, min_history=10)
+    fixed = XSMomentum(lookback=252, top_n=10, bottom_n=0, min_history=30,
+                       rebalance_freq="ME", skip_recent=21)
     is_weights = fixed.generate_weights(prices)
     is_result = run_portfolio_weights(prices, is_weights, cfg)
 
     start = result.oos_equity.index[0]
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.plot(result.oos_equity.index, result.oos_equity,
-            label="Walk-forward OOS", linewidth=1.8)
+            label="WF OOS (v2)", linewidth=1.8)
     ax.plot(ew_bh.loc[start:].index, ew_bh.loc[start:],
             label="Equal-weight B&H", linewidth=1.0, alpha=0.8)
     ax.plot(is_result.equity.loc[start:].index, is_result.equity.loc[start:],
-            label="In-sample (LB=60, top=5)", linewidth=1.0, alpha=0.6, linestyle="--")
-    ax.set_title("XS Momentum (long-only) — walk-forward vs references")
+            label="In-sample (LB=252, top=10)", linewidth=1.0,
+            alpha=0.6, linestyle="--")
+    ax.set_title(f"XS Momentum v2 — walk-forward OOS ({len(prices)} symbols)")
     ax.set_ylabel("Equity ($)")
     ax.legend()
     ax.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(OUT_DIR / "wf_xsm_equity.png", dpi=120)
-    print(f"saved {OUT_DIR / 'wf_xsm_equity.png'}")
+    plt.savefig(OUT_DIR / "wf_xsm_v2_equity.png", dpi=120)
+    print(f"\nsaved {OUT_DIR / 'wf_xsm_v2_equity.png'}")
+    print(f"saved {OUT_DIR / 'wf_xsm_v2_folds.csv'}")
 
 
 if __name__ == "__main__":
-    import sys
-    name = sys.argv[1] if len(sys.argv) > 1 else "large_cap_30"
+    name = sys.argv[1] if len(sys.argv) > 1 else "large_cap_100"
     main(name)
