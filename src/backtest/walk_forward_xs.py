@@ -1,85 +1,35 @@
-"""Walk-forward validation.
+"""Walk-forward validation for cross-sectional (weight-based) strategies.
 
-Two entry points share a common date-slicing utility:
-  - walk_forward         : single-symbol, picks strategy params per fold
-  - walk_forward_weights : cross-sectional, picks XS-strategy params per fold
-
-Both produce a stitched out-of-sample equity curve.
+Each fold:
+  - Grid-search parameters on the TRAIN window (via run_portfolio_weights).
+  - Pick the params that maximize `select_metric` on train.
+  - Apply the chosen params to the TEST window (out-of-sample).
+  - Append the test-period portfolio returns to the stitched OOS series.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Protocol
 
-import numpy as np
 import pandas as pd
 
-from src.backtest.engine import BacktestConfig, run_backtest
+from src.backtest.engine import BacktestConfig
+from src.backtest.portfolio import run_portfolio_weights
 from src.backtest.sweep import _expand_grid
-from src.strategies.base import Strategy
+from src.backtest.walk_forward import date_slices, max_dd, sharpe
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
+class XSStrategy(Protocol):
+    """Protocol: any object with `generate_weights(prices_by_symbol) -> DataFrame`."""
 
-def sharpe(returns: pd.Series, periods: int = 252) -> float:
-    r = returns.dropna()
-    if len(r) < 2 or r.std(ddof=1) == 0:
-        return 0.0
-    return float(r.mean() / r.std(ddof=1) * periods ** 0.5)
+    def generate_weights(self, prices_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame: ...
 
-
-def max_dd(equity: pd.Series) -> float:
-    if len(equity) < 2:
-        return 0.0
-    dd = equity / equity.cummax() - 1.0
-    return float(-dd.min())
-
-
-def date_slices(
-    index: pd.DatetimeIndex,
-    train_years: int,
-    test_years: int,
-    step_years: int,
-) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
-    """Rolling (train_start, train_end, test_start, test_end) tuples.
-
-    Windows are calendar-based. train_end == test_start, no look-ahead.
-    """
-    if train_years <= 0 or test_years <= 0 or step_years <= 0:
-        raise ValueError("train_years, test_years, step_years must be positive")
-
-    start = index.min()
-    end = index.max()
-    folds: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
-
-    train_start = start
-    while True:
-        train_end = train_start + pd.DateOffset(years=train_years)
-        test_start = train_end
-        test_end = test_start + pd.DateOffset(years=test_years)
-        if test_start >= end:
-            break
-        test_end = min(test_end, end + pd.Timedelta(days=1))
-        folds.append((train_start, train_end, test_start, test_end))
-        train_start = train_start + pd.DateOffset(years=step_years)
-    return folds
-
-
-# Keep a private alias for back-compat with anything importing the underscore name.
-_date_slices = date_slices
-
-
-# ---------------------------------------------------------------------------
-# Result container
-# ---------------------------------------------------------------------------
 
 @dataclass
-class WalkForwardResult:
+class WalkForwardXSResult:
     oos_equity: pd.Series
     oos_returns: pd.Series
     folds: pd.DataFrame
@@ -98,31 +48,63 @@ class WalkForwardResult:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Single-symbol walk-forward (unchanged behavior)
-# ---------------------------------------------------------------------------
+def _slice_prices(
+    prices_by_symbol: dict[str, pd.DataFrame],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    for sym, df in prices_by_symbol.items():
+        sub = df.loc[(df.index >= start) & (df.index < end)]
+        if not sub.empty:
+            out[sym] = sub
+    return out
 
-def walk_forward(
-    prices: pd.DataFrame,
-    strategy_cls: type[Strategy],
+
+def walk_forward_xs(
+    prices_by_symbol: dict[str, pd.DataFrame],
+    strategy_factory: Callable[..., XSStrategy],
     param_grid: dict[str, Iterable[Any]],
     train_years: int = 3,
     test_years: int = 1,
     step_years: int = 1,
     select_metric: str = "sharpe",
     config: BacktestConfig | None = None,
-    feature_builder: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
-) -> WalkForwardResult:
+    min_symbols: int = 5,
+) -> WalkForwardXSResult:
+    """Walk-forward for a cross-sectional strategy.
+
+    Parameters
+    ----------
+    prices_by_symbol : dict[str, DataFrame]
+        One OHLCV frame per symbol. All must contain an `adj close` column.
+    strategy_factory : callable
+        Called as `strategy_factory(**params)` to build the strategy.
+    param_grid : dict[str, Iterable]
+        e.g. {"lookback": [20, 60, 120], "top_n": [3, 5, 10]}
+    select_metric : str
+        One of {"sharpe", "total_return", "calmar", "sortino"}.
+    min_symbols : int
+        Skip folds where fewer than this many symbols have data.
+    """
     if select_metric not in {"sharpe", "total_return", "calmar", "sortino"}:
         raise ValueError(f"unsupported select_metric: {select_metric!r}")
+    if not prices_by_symbol:
+        raise ValueError("prices_by_symbol is empty")
 
     cfg = config or BacktestConfig()
     combos = _expand_grid(param_grid)
     if not combos:
         raise ValueError("param_grid produced no combinations")
 
-    index = prices.index
-    folds = date_slices(index, train_years, test_years, step_years)
+    # Common calendar index (union of all symbols' indexes).
+    common_index: pd.DatetimeIndex | None = None
+    for df in prices_by_symbol.values():
+        common_index = df.index if common_index is None else common_index.union(df.index)
+    assert common_index is not None
+    common_index = common_index.sort_values()
+
+    folds = date_slices(common_index, train_years, test_years, step_years)
     if not folds:
         raise ValueError("not enough history for the requested train/test windows")
 
@@ -131,22 +113,23 @@ def walk_forward(
     best_params_per_fold: list[dict[str, Any]] = []
 
     for i, (tr_s, tr_e, te_s, te_e) in enumerate(folds):
-        train = prices.loc[(index >= tr_s) & (index < tr_e)]
-        test = prices.loc[(index >= te_s) & (index < te_e)]
-        if train.empty or test.empty:
-            logger.warning("fold %d empty slice, skipping", i)
+        train = _slice_prices(prices_by_symbol, tr_s, tr_e)
+        test = _slice_prices(prices_by_symbol, te_s, te_e)
+        if len(train) < min_symbols or len(test) < min_symbols:
+            logger.warning(
+                "fold %d skipping: train=%d test=%d (min=%d)",
+                i, len(train), len(test), min_symbols,
+            )
             continue
 
-        train_feat = feature_builder(train) if feature_builder else train
-        test_feat = feature_builder(test) if feature_builder else test
-
+        # --- Grid-search on train
         best_row: pd.Series | None = None
         best_params: dict[str, Any] | None = None
         for params in combos:
             try:
-                strat = strategy_cls(**params)
-                sig = strat.generate_signals(train_feat)
-                res = run_backtest(train, sig, cfg)
+                strat = strategy_factory(**params)
+                weights = strat.generate_weights(train)
+                res = run_portfolio_weights(train, weights, cfg)
             except Exception as e:  # noqa: BLE001
                 logger.debug("fold %d train failed for %s: %s", i, params, e)
                 continue
@@ -159,9 +142,10 @@ def walk_forward(
             logger.warning("fold %d: no valid params, skipping", i)
             continue
 
-        strat = strategy_cls(**best_params)
-        sig = strat.generate_signals(test_feat)
-        test_result = run_backtest(test, sig, cfg)
+        # --- Apply chosen params on test
+        strat = strategy_factory(**best_params)
+        test_weights = strat.generate_weights(test)
+        test_result = run_portfolio_weights(test, test_weights, cfg)
 
         oos_pieces.append(test_result.returns)
         best_params_per_fold.append({**best_params, "fold": i})
@@ -173,6 +157,8 @@ def walk_forward(
                 "train_end": (tr_e - pd.Timedelta(days=1)).date(),
                 "test_start": te_s.date(),
                 "test_end": (te_e - pd.Timedelta(days=1)).date(),
+                "n_train_symbols": len(train),
+                "n_test_symbols": len(test),
                 **{f"best_{k}": v for k, v in best_params.items()},
                 "train_sharpe": float(best_row["sharpe"]),
                 "train_total_return": float(best_row["total_return"]),
@@ -183,10 +169,12 @@ def walk_forward(
         )
 
         logger.info(
-            "fold %d  train %s..%s  test %s..%s  params=%s  train %s=%.3f  test %s=%.3f",
+            "fold %d  train %s..%s  test %s..%s  symbols=%d  params=%s  "
+            "train %s=%.3f  test %s=%.3f",
             i,
             tr_s.date(), (tr_e - pd.Timedelta(days=1)).date(),
             te_s.date(), (te_e - pd.Timedelta(days=1)).date(),
+            len(test),
             best_params,
             select_metric, float(best_row[select_metric]),
             select_metric, float(test_result.metrics[select_metric]),
@@ -199,7 +187,7 @@ def walk_forward(
     oos_returns = oos_returns[~oos_returns.index.duplicated(keep="first")]
     oos_equity = cfg.initial_capital * (1.0 + oos_returns).cumprod()
 
-    return WalkForwardResult(
+    return WalkForwardXSResult(
         oos_equity=oos_equity,
         oos_returns=oos_returns,
         folds=pd.DataFrame(fold_rows),
