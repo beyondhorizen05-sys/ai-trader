@@ -1,7 +1,9 @@
 """Cross-sectional momentum: long top-N by trailing return, optionally short bottom-N.
 
-Gross exposure is normalized to 1.0 for all configs (long-only and long/short
-alike) so that comparisons across configurations are apples-to-apples.
+Supports:
+  - 12-1 momentum (skip the most recent `skip_recent` bars)
+  - optional sector neutralization
+  - monthly/weekly rebalancing (weights held constant between rebalance dates)
 """
 from __future__ import annotations
 
@@ -15,30 +17,6 @@ from src.features.cross_sectional import to_panel, top_n_mask
 
 @dataclass
 class XSMomentum:
-    """Cross-sectional momentum with equal weights within each leg.
-
-    Parameters
-    ----------
-    lookback : int
-        Trailing return window in bars.
-    top_n : int
-        Number of symbols to go long each bar.
-    bottom_n : int
-        Number of symbols to short each bar. 0 -> long-only.
-    min_history : int
-        Skip bars with fewer than this many symbols having valid data.
-    skip_recent : int
-        Bars to exclude from the momentum signal. 0 = classic momentum,
-        21 = "12-1" style (skip the most recent month).
-    sectors : dict[str, str], optional
-        Map symbol -> sector. When provided, ranking is performed *within*
-        sector, then long/short selections are pooled across sectors.
-    gross_exposure : float
-        Total gross exposure (sum of |weights| across all positions).
-        Default 1.0. A long/short config with gross=1.0 puts 0.5 on the
-        long side and 0.5 on the short side.
-    """
-
     lookback: int = 60
     top_n: int = 5
     bottom_n: int = 5
@@ -46,6 +24,7 @@ class XSMomentum:
     skip_recent: int = 0
     sectors: dict[str, str] = field(default_factory=dict)
     gross_exposure: float = 1.0
+    rebalance_freq: str | None = "W"     # None = daily, "W" weekly, "ME" monthly
 
     def __post_init__(self) -> None:
         if self.lookback <= 0:
@@ -62,6 +41,10 @@ class XSMomentum:
             raise ValueError("skip_recent must be < lookback")
         if self.gross_exposure <= 0:
             raise ValueError("gross_exposure must be > 0")
+
+    # ------------------------------------------------------------------
+    # Signal
+    # ------------------------------------------------------------------
 
     def _momentum_panel(self, closes: dict[str, pd.Series]) -> pd.DataFrame:
         panel = to_panel(closes).sort_index()
@@ -90,7 +73,9 @@ class XSMomentum:
 
         n_sectors = max(len(by_sector), 1)
         longs_per_sector = max(self.top_n // n_sectors, 1)
-        shorts_per_sector = max(self.bottom_n // n_sectors, 1) if self.bottom_n > 0 else 0
+        shorts_per_sector = (
+            max(self.bottom_n // n_sectors, 1) if self.bottom_n > 0 else 0
+        )
 
         for sec, cols in by_sector.items():
             sub = momentum[cols]
@@ -102,7 +87,33 @@ class XSMomentum:
 
         return long_mask, short_mask
 
-    def generate_weights(self, prices_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    # ------------------------------------------------------------------
+    # Rebalance dates
+    # ------------------------------------------------------------------
+
+    def _rebalance_dates(self, index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        """Return actual trading-day timestamps on which to rebalance.
+
+        Uses the FIRST trading day of each period, so every returned timestamp
+        exists in `index`. This avoids the resample-bin-label mismatch that
+        occurs with pandas 2.2+ ``resample().last().index`` (which produces
+        weekend labels that do not exist in a Mon-Fri trading calendar).
+        """
+        if self.rebalance_freq is None:
+            return index
+
+        s = pd.Series(index, index=index)
+        # Group by period, take the first timestamp per period.
+        grouped = s.groupby(pd.Grouper(freq=self.rebalance_freq)).first().dropna()
+        return pd.DatetimeIndex(grouped.values)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_weights(
+        self, prices_by_symbol: dict[str, pd.DataFrame]
+    ) -> pd.DataFrame:
         closes = {
             sym: df["adj close"] if "adj close" in df.columns else df["close"]
             for sym, df in prices_by_symbol.items()
@@ -116,11 +127,9 @@ class XSMomentum:
         long_mask = long_mask.where(enough, False).fillna(False).astype(bool)
         short_mask = short_mask.where(enough, False).fillna(False).astype(bool)
 
-        # --- Normalize so gross exposure is exactly `gross_exposure`.
         n_long = long_mask.sum(axis=1).replace(0, np.nan)
         n_short = short_mask.sum(axis=1).replace(0, np.nan)
 
-        # Split gross equally between long and short legs when both are active.
         if self.bottom_n > 0:
             half = self.gross_exposure / 2.0
             w_long = long_mask.astype(float).div(n_long, axis=0) * half
@@ -129,6 +138,19 @@ class XSMomentum:
         else:
             w_long = long_mask.astype(float).div(n_long, axis=0) * self.gross_exposure
             weights = w_long.fillna(0.0)
+
+        # --- Rebalance: hold weights constant between rebalance dates.
+        if self.rebalance_freq is not None:
+            rebal_dates = self._rebalance_dates(weights.index)
+            keep_mask = pd.DataFrame(
+                np.tile(
+                    weights.index.isin(rebal_dates).reshape(-1, 1),
+                    (1, weights.shape[1]),
+                ),
+                index=weights.index,
+                columns=weights.columns,
+            )
+            weights = weights.where(keep_mask).ffill().fillna(0.0)
 
         weights = weights.shift(1).fillna(0.0)
         return weights
