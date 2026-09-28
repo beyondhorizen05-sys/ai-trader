@@ -3,8 +3,10 @@ config/secrets.env
 *.env
 
 # Data
-data/raw/
-data/processed/
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
 
 # Python
 __pycache__/
