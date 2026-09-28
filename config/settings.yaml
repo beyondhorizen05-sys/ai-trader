@@ -1,0 +1,6 @@
+﻿data:
+  symbols: [AAPL, MSFT, SPY]
+  timeframe: 1d
+  start: 2015-01-01
+  end: 2024-12-31
+  source: yfinance
