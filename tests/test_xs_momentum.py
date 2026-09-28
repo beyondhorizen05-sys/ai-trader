@@ -37,16 +37,30 @@ def test_xs_momentum_rejects_bad_params():
         XSMomentum(top_n=0)
     with pytest.raises(ValueError):
         XSMomentum(bottom_n=-1)
+    with pytest.raises(ValueError):
+        XSMomentum(gross_exposure=0)
 
 
-def test_xs_momentum_weights_sum_to_expected_gross():
+def test_xs_momentum_long_short_gross_is_one():
+    """Long/short configs normalize gross exposure to 1.0 (0.5 long + 0.5 short)."""
     prices = _make_prices({"A": 0.001, "B": 0.002, "C": -0.001, "D": -0.002, "E": 0.0})
     strat = XSMomentum(lookback=20, top_n=2, bottom_n=2, min_history=5)
     w = strat.generate_weights(prices)
 
     post = w.iloc[30:]
-    active = post.abs().sum(axis=1)
-    nonzero = active[active > 0]
+    gross = post.abs().sum(axis=1)
+    nonzero = gross[gross > 0]
+    assert len(nonzero) > 0
+    assert np.allclose(nonzero.values, 1.0, atol=1e-9)
+
+
+def test_xs_momentum_long_only_gross_is_one():
+    prices = _make_prices({"A": 0.001, "B": 0.002, "C": -0.001, "D": -0.002, "E": 0.0})
+    strat = XSMomentum(lookback=20, top_n=2, bottom_n=0, min_history=5)
+    w = strat.generate_weights(prices)
+    post = w.iloc[30:]
+    gross = post.abs().sum(axis=1)
+    nonzero = gross[gross > 0]
     assert len(nonzero) > 0
     assert np.allclose(nonzero.values, 1.0, atol=1e-9)
 
@@ -68,7 +82,6 @@ def test_xs_momentum_long_only_when_bottom_n_zero():
     prices = _make_prices({"A": 0.002, "B": 0.001, "C": -0.001})
     strat = XSMomentum(lookback=20, top_n=1, bottom_n=0, min_history=3)
     w = strat.generate_weights(prices)
-    # DataFrame >= scalar -> DataFrame of bools; .all().all() collapses to a scalar
     assert (w >= -1e-12).all().all()
 
 
